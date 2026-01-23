@@ -1,0 +1,424 @@
+package main
+
+import (
+	"archive/zip"
+	"bufio"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+const clamdscanBinary = "/usr/bin/clamdscan"
+
+// Regex to parse ClamAV output - compiled once at startup
+// Matches lines like: /path/to/file: VirusName FOUND
+var infectedRegex = regexp.MustCompile(`^(.+):\s+(.+)\s+FOUND$`)
+
+// Scanner handles ClamAV scanning operations
+type Scanner struct {
+	config *Config
+}
+
+// ScanResult holds the complete scan results
+type ScanResult struct {
+	Threats      []Threat
+	ScannedFiles int
+}
+
+// NewScanner creates a new ClamAV scanner
+func NewScanner(config *Config) *Scanner {
+	return &Scanner{
+		config: config,
+	}
+}
+
+// GetVersion returns ClamAV and database versions
+func (s *Scanner) GetVersion() (string, string) {
+	cmd := exec.Command(clamdscanBinary, "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return "unknown", "unknown"
+	}
+
+	// Parse version string like "ClamAV 1.0.0/26789/Mon Jan 1 12:00:00 2024"
+	versionStr := strings.TrimSpace(string(output))
+	parts := strings.Split(versionStr, "/")
+
+	clamVersion := "unknown"
+	dbVersion := "unknown"
+
+	if len(parts) >= 1 {
+		clamVersion = strings.TrimPrefix(parts[0], "ClamAV ")
+	}
+	if len(parts) >= 2 {
+		dbVersion = parts[1]
+	}
+
+	return clamVersion, dbVersion
+}
+
+// ScanFile scans a file with ClamAV.
+// If the file is a ZIP archive, it extracts and scans the contents.
+// If not a ZIP, it scans the file directly.
+func (s *Scanner) ScanFile(filePath string) (*ScanResult, error) {
+	if s.config.DebugMode {
+		log.Printf("ScanFile: starting scan of %s", filePath)
+	}
+
+	// Create temp directory for scanning
+	tempDir, err := os.MkdirTemp("", "clamav-extract-")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Try to extract as ZIP archive first
+	fileCount, err := s.extractZipSafe(filePath, tempDir)
+	if err != nil {
+		// Not a valid ZIP - scan as single file instead
+		if s.config.DebugMode {
+			log.Printf("ScanFile: not a ZIP archive, scanning as single file")
+		}
+
+		fileCount, err = s.copySingleFile(filePath, tempDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare file for scanning: %w", err)
+		}
+	} else if s.config.DebugMode {
+		log.Printf("ScanFile: extracted %d files from archive", fileCount)
+	}
+
+	// Run ClamAV on extracted directory with timeout
+	threats, err := s.runClamAV(tempDir)
+	if err != nil {
+		return nil, fmt.Errorf("ClamAV scan failed: %w", err)
+	}
+
+	if s.config.DebugMode {
+		log.Printf("ScanFile: ClamAV found %d threats", len(threats))
+	}
+
+	// Compute file hashes for detected threats
+	for i := range threats {
+		fullPath := filepath.Join(tempDir, threats[i].File)
+		hash, err := computeFileHash(fullPath)
+		if err != nil {
+			if s.config.DebugMode {
+				log.Printf("Warning: could not compute hash for %s: %v", fullPath, err)
+			}
+		} else {
+			threats[i].FileHash = hash
+		}
+	}
+
+	return &ScanResult{
+		Threats:      threats,
+		ScannedFiles: fileCount,
+	}, nil
+}
+
+// computeFileHash computes the SHA256 hash of a file
+func computeFileHash(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// runClamAV executes ClamAV on a directory and parses output
+func (s *Scanner) runClamAV(targetDir string) ([]Threat, error) {
+	// Ensure temp directory is readable by clamav user (for clamdscan)
+	// clamdscan runs through the clamd daemon which runs as 'clamav' user
+	os.Chmod(targetDir, 0755)
+	filepath.Walk(targetDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil {
+			if info.IsDir() {
+				os.Chmod(path, 0755)
+			} else {
+				os.Chmod(path, 0644)
+			}
+		}
+		return nil
+	})
+
+	// Build scan command for clamdscan
+	// clamdscan connects to clamd daemon (faster - signatures already loaded)
+	// --no-summary: skip summary at end (cleaner parsing)
+	// --infected: only show infected files
+	// --fdpass: pass file descriptor to daemon (faster for local files)
+	// --multiscan: scan in parallel
+	// Note: clamdscan scans directories recursively by default
+	args := []string{
+		"--no-summary",
+		"--infected",
+		"--fdpass",
+		"--multiscan",
+		targetDir,
+	}
+
+	if s.config.DebugMode {
+		log.Printf("Running: %s %v", clamdscanBinary, args)
+	}
+
+	// Create context with timeout for the scan
+	ctx, cancel := context.WithTimeout(context.Background(), s.config.ScanTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, clamdscanBinary, args...)
+	output, err := cmd.CombinedOutput()
+	outputStr := string(output)
+
+	// Check for timeout
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("scan timed out after %v", s.config.ScanTimeout)
+	}
+
+	if s.config.DebugMode {
+		log.Printf("ClamAV finished. output=%d bytes, err=%v", len(output), err)
+
+		if len(output) > 0 {
+			preview := outputStr
+			if len(preview) > 500 {
+				preview = preview[:500] + "..."
+			}
+			log.Printf("ClamAV output: %s", preview)
+		}
+	}
+
+	// Parse the output for threats
+	// ClamAV exit codes:
+	// 0 = no virus found
+	// 1 = virus(es) found
+	// 2 = some error(s) occurred
+	threats := parseClamAVOutput(outputStr, targetDir)
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode := exitErr.ExitCode()
+			// Exit code 1 means virus found - not an error for us
+			if exitCode == 1 {
+				if s.config.DebugMode {
+					log.Printf("ClamAV exit code 1: virus(es) found")
+				}
+				return threats, nil
+			}
+			// Exit code 2 is an actual error
+			if exitCode == 2 {
+				return nil, fmt.Errorf("clamdscan error (exit %d): %s", exitCode, outputStr)
+			}
+		}
+		return nil, fmt.Errorf("clamdscan error: %v", err)
+	}
+
+	return threats, nil
+}
+
+// parseClamAVOutput parses ClamAV text output into Threat structs
+//
+// ClamAV output format:
+//
+//	/path/to/file: VirusName FOUND
+//	/path/to/clean/file: OK
+//
+// With --infected flag, only FOUND lines are shown
+func parseClamAVOutput(output string, baseDir string) []Threat {
+	var threats []Threat
+
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// Skip summary lines and warnings
+		if strings.HasPrefix(line, "---") ||
+			strings.HasPrefix(line, "Known") ||
+			strings.HasPrefix(line, "Engine") ||
+			strings.HasPrefix(line, "Scanned") ||
+			strings.HasPrefix(line, "Data") ||
+			strings.HasPrefix(line, "Time") ||
+			strings.HasPrefix(line, "Start") ||
+			strings.HasPrefix(line, "End") {
+			continue
+		}
+
+		if matches := infectedRegex.FindStringSubmatch(line); len(matches) == 3 {
+			filePath := matches[1]
+			virusName := matches[2]
+
+			// Make path relative to base directory
+			relPath := strings.TrimPrefix(filePath, baseDir)
+			relPath = strings.TrimPrefix(relPath, string(os.PathSeparator))
+
+			threat := Threat{
+				Name:     virusName,
+				File:     relPath,
+				Severity: "critical", // All malware is critical
+			}
+
+			threats = append(threats, threat)
+			log.Printf("Found threat: %s in %s", virusName, relPath)
+		}
+	}
+
+	return threats
+}
+
+// copySingleFile copies a non-archive file to the temp directory for scanning.
+// Returns file count (always 1 on success).
+// Enforces the same size limits as archive extraction.
+func (s *Scanner) copySingleFile(filePath, targetDir string) (int, error) {
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to stat file: %w", err)
+	}
+
+	if uint64(info.Size()) > s.config.MaxSingleFileSize {
+		return 0, fmt.Errorf("file exceeds size limit (%d > %d bytes)",
+			info.Size(), s.config.MaxSingleFileSize)
+	}
+
+	src, err := os.Open(filePath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer src.Close()
+
+	// Create destination file in temp directory
+	// Use a generic name since original filename isn't important for scanning
+	dstPath := filepath.Join(targetDir, "file")
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer dst.Close()
+
+	// Copy with size limit enforcement
+	limitedReader := io.LimitReader(src, int64(s.config.MaxSingleFileSize)+1)
+	written, err := io.Copy(dst, limitedReader)
+	if err != nil {
+		return 0, fmt.Errorf("failed to copy file: %w", err)
+	}
+
+	// Check if file exceeded limit during copy
+	if written > int64(s.config.MaxSingleFileSize) {
+		os.Remove(dstPath)
+		return 0, fmt.Errorf("file exceeded size limit during copy")
+	}
+
+	return 1, nil
+}
+
+// extractZipSafe extracts a ZIP file with zip bomb protection.
+// Returns the number of files extracted.
+//
+// Security measures:
+// - Limits total extracted size to prevent disk exhaustion
+// - Limits number of files to prevent inode exhaustion
+// - Limits individual file size
+// - Prevents zip slip attacks (path traversal)
+func (s *Scanner) extractZipSafe(zipPath, targetDir string) (int, error) {
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return 0, err
+	}
+	defer reader.Close()
+
+	fileCount := 0
+	totalSize := int64(0)
+
+	for _, file := range reader.File {
+		// Check file count limit
+		fileCount++
+		if fileCount > s.config.MaxFileCount {
+			return 0, fmt.Errorf("archive contains too many files (limit: %d)", s.config.MaxFileCount)
+		}
+
+		// Check individual file size limit (from header)
+		if file.UncompressedSize64 > s.config.MaxSingleFileSize {
+			return 0, fmt.Errorf("file %s exceeds size limit (%d > %d bytes)",
+				file.Name, file.UncompressedSize64, s.config.MaxSingleFileSize)
+		}
+
+		// Check total extracted size (using header info)
+		totalSize += int64(file.UncompressedSize64)
+		if totalSize > s.config.MaxExtractedSize {
+			return 0, fmt.Errorf("archive exceeds total size limit (%d bytes)", s.config.MaxExtractedSize)
+		}
+
+		// Build target path
+		targetPath := filepath.Join(targetDir, file.Name)
+
+		// Security check: prevent zip slip attack
+		if !strings.HasPrefix(targetPath, filepath.Clean(targetDir)+string(os.PathSeparator)) {
+			continue // Skip files that would escape target directory
+		}
+
+		if file.FileInfo().IsDir() {
+			os.MkdirAll(targetPath, 0755)
+			continue
+		}
+
+		// Create parent directories
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fileCount, err
+		}
+
+		// Extract file with size limit enforcement
+		if err := s.extractFileSafe(file, targetPath); err != nil {
+			return fileCount, err
+		}
+	}
+
+	return fileCount, nil
+}
+
+// extractFileSafe extracts a single file from the ZIP with size limit enforcement.
+// This provides runtime protection against deceptive header sizes.
+func (s *Scanner) extractFileSafe(file *zip.File, targetPath string) error {
+	src, err := file.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	// Use LimitReader to enforce size limit during extraction
+	// This protects against archives with false header sizes
+	limitedReader := io.LimitReader(src, int64(s.config.MaxSingleFileSize)+1)
+
+	written, err := io.Copy(dst, limitedReader)
+	if err != nil {
+		return err
+	}
+
+	// Check if we hit the limit (file was larger than allowed)
+	if written > int64(s.config.MaxSingleFileSize) {
+		os.Remove(targetPath) // Clean up partial file
+		return fmt.Errorf("file %s exceeded size limit during extraction", file.Name)
+	}
+
+	return nil
+}
