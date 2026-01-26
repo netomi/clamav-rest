@@ -92,7 +92,7 @@ clamd --config-file /var/run/clamav/clamd.conf &
 echo "Waiting for clamd to load virus definitions..."
 max_wait=180
 waited=0
-while ! clamdscan --ping 1 2>/dev/null; do
+while ! clamdscan --config-file /var/run/clamav/clamd.conf --ping 1 2>/dev/null; do
     if [ $waited -ge $max_wait ]; then
         echo "Error: clamd failed to start within ${max_wait}s"
         if [ -f /var/log/clamav/clamd.log ]; then
