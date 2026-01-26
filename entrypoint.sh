@@ -69,7 +69,7 @@ DatabaseDirectory /var/lib/clamav
 
 # Update settings
 DatabaseMirror database.clamav.net
-NotifyClamd /etc/clamav/clamd.conf
+NotifyClamd /var/run/clamav/clamd.conf
 
 # Logging
 LogTime yes
