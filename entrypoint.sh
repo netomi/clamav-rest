@@ -8,9 +8,10 @@
 #
 # Startup sequence:
 # 1. Generate clamd.conf and freshclam.conf from environment variables
-# 2. Update virus definitions with freshclam
-# 3. Start clamd daemon in background
-# 4. Start REST API server
+# 2. Start clamd with existing definitions (from image)
+# 3. Update virus definitions (clamd reloads automatically via NotifyClamd)
+# 4. Start freshclam daemon for periodic updates
+# 5. Start REST API server
 
 set -e
 
@@ -105,9 +106,7 @@ echo "ClamAV configuration files generated."
 # Create log file (required for clamd to start)
 touch /var/log/clamav/clamd.log
 
-echo "Updating ClamAV virus definitions..."
-freshclam --config-file=${FRESHCLAM_CONF} --stdout || echo "Warning: freshclam update failed (continuing with existing definitions)"
-
+# Start clamd first with existing definitions (from image)
 echo "Starting clamd daemon..."
 clamd --config-file=${CLAMD_CONF} &
 
@@ -126,10 +125,14 @@ while ! clamdscan --config-file=${CLAMD_CONF} --ping 1 2>/dev/null; do
 done
 echo "clamd is ready!"
 
-# Start freshclam daemon for periodic updates (checks every hour)
+# Update virus definitions now that clamd is running (NotifyClamd will reload them)
+echo "Updating ClamAV virus definitions..."
+freshclam --config-file=${FRESHCLAM_CONF} --stdout || echo "Warning: freshclam update failed (continuing with existing definitions)"
+
+# Start freshclam daemon for periodic updates
 echo "Starting freshclam daemon for automatic updates..."
 freshclam --config-file=${FRESHCLAM_CONF} --daemon &
 
-# Start REST server (runs as same user - no privilege switching needed)
+# Start REST server
 echo "Starting ClamAV REST server on port ${PORT:-9000}..."
 exec ./clamav-rest
