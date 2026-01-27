@@ -118,6 +118,14 @@ Prevents slowloris attacks and resource exhaustion from slow clients.
 |----------|---------|-------------|
 | `SCAN_TIMEOUT_MINUTES` | `5` | Max time for ClamAV scan |
 
+### Virus Definition Updates
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FRESHCLAM_CHECKS` | `24` | Times per day to check for updates (24=hourly, 12=every 2h, 1=daily) |
+
+Freshclam runs as a daemon and automatically updates virus definitions. When updates are found, clamd reloads them without restart.
+
 ## Deployment
 
 ### Requirements
